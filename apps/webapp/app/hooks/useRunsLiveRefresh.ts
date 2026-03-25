@@ -1,31 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTypedFetcher } from "remix-typedjson";
+import {
+  createRefreshPath,
+  createRootViewSnapshot,
+  createRunsRefreshPath,
+  getCurrentBackgroundRunsData,
+  type RefreshRequestKind,
+  type RefreshRunsData,
+  type RootViewSnapshot,
+} from "~/hooks/runsLiveRefresh.shared";
 import { useAutoRevalidate } from "~/hooks/useAutoRevalidate";
 import { useOptimisticLocation } from "~/hooks/useOptimisticLocation";
 import { useSearchParams } from "~/hooks/useSearchParam";
 
 const defaultPaginatedPollIntervalMs = 10_000;
 const defaultRootPollIntervalMs = 10_000;
-
-type RefreshRunsData<TRun> =
-  | {
-      ok: true;
-      mode: "background" | "manual";
-      runs: TRun[];
-      hasNewRuns: boolean;
-      newRunsCount: number;
-      snapshotKey?: string;
-      pagination?: {
-        next?: string | null;
-        previous?: string | null;
-      };
-    }
-  | {
-      ok: false;
-      mode: "background" | "manual";
-      error: string;
-      snapshotKey?: string;
-    };
 
 type RunsListShape<TRun extends { friendlyId: string; createdAt: Date | string }> = {
   runs: TRun[];
@@ -36,7 +25,7 @@ type RunsListShape<TRun extends { friendlyId: string; createdAt: Date | string }
 
 type UseRunsLiveRefreshOptions<
   TRun extends { friendlyId: string; createdAt: Date | string },
-  TList extends RunsListShape<TRun>,
+  TList extends RunsListShape<TRun>
 > = {
   list: TList;
   organizationSlug: string;
@@ -46,9 +35,17 @@ type UseRunsLiveRefreshOptions<
   rootPollInterval?: number;
 };
 
+type RootOverride<
+  TRun extends { friendlyId: string; createdAt: Date | string },
+  TList extends RunsListShape<TRun>
+> = {
+  runs: TList["runs"];
+  pagination?: TList["pagination"];
+};
+
 export function useRunsLiveRefresh<
   TRun extends { friendlyId: string; createdAt: Date | string },
-  TList extends RunsListShape<TRun>,
+  TList extends RunsListShape<TRun>
 >({
   list,
   organizationSlug,
@@ -71,79 +68,48 @@ export function useRunsLiveRefresh<
   const [isRefreshingLatest, setIsRefreshingLatest] = useState(false);
   const [backgroundError, setBackgroundError] = useState<string>();
   const [manualRefreshError, setManualRefreshError] = useState<string>();
-  const [rootOverride, setRootOverride] = useState<{
-    runs: TRun[];
-    pagination?: TList["pagination"];
-  }>();
-  const previousRefreshPathRef = useRef<string>();
-  // Keep a client-side snapshot of the root view so background polling can refresh the
-  // visible rows without shifting the first page underneath the user.
-  const [rootViewSnapshot, setRootViewSnapshot] = useState(() =>
-    isRootEquivalentView ? createRootViewSnapshot(list.runs) : undefined
-  );
-  const currentSnapshotKey = rootViewSnapshot?.snapshotKey;
+  const refreshPath = useMemo(() => {
+    return createRefreshPath(location.pathname, location.search);
+  }, [location.pathname, location.search]);
+  // Root views keep a client snapshot so background polling can update the visible rows
+  // without shifting the first page underneath the user.
+  const { rootOverride, rootViewSnapshot, setRootOverride, setRootViewSnapshot } = useRootViewState<
+    TRun,
+    TList
+  >({
+    isRootEquivalentView,
+    refreshPath,
+    runs: list.runs,
+  });
 
+  // Clear any prior refresh errors when the user switches between root and paginated views,
+  // or when the effective root-view filters change.
   useEffect(() => {
     if (!isRootEquivalentView) {
-      setRootViewSnapshot(undefined);
-      setRootOverride(undefined);
       setBackgroundError(undefined);
       setManualRefreshError(undefined);
       return;
     }
 
-    if (rootOverride) {
-      return;
-    }
-
-    setRootViewSnapshot(createRootViewSnapshot(list.runs));
-  }, [isRootEquivalentView, list.runs, rootOverride]);
-
-  const refreshPath = useMemo(() => {
-    const searchParams = new URLSearchParams(location.search);
-    searchParams.delete("cursor");
-    searchParams.delete("direction");
-
-    const query = searchParams.toString();
-    return `${location.pathname}${query ? `?${query}` : ""}`;
-  }, [location.pathname, location.search]);
-
-  useEffect(() => {
-    if (previousRefreshPathRef.current === refreshPath) {
-      return;
-    }
-
-    previousRefreshPathRef.current = refreshPath;
-    setRootOverride(undefined);
     setBackgroundError(undefined);
     setManualRefreshError(undefined);
+  }, [isRootEquivalentView, refreshPath]);
 
-    if (isRootEquivalentView) {
-      setRootViewSnapshot(createRootViewSnapshot(list.runs));
-    }
-  }, [refreshPath, isRootEquivalentView, list.runs]);
+  const currentSnapshotKey = rootViewSnapshot?.snapshotKey;
 
   const backgroundRunsPath = useMemo(() => {
     if (!isRootEquivalentView || !rootViewSnapshot || rootViewSnapshot.visibleRunIds.length === 0) {
       return undefined;
     }
 
-    const searchParams = new URLSearchParams(location.search);
-    searchParams.delete("cursor");
-    searchParams.delete("direction");
-
-    if (rootViewSnapshot.latestCreatedAt) {
-      searchParams.set("latestCreatedAt", rootViewSnapshot.latestCreatedAt);
-    }
-
-    searchParams.set("requestKind", "background");
-    searchParams.set("snapshotKey", rootViewSnapshot.snapshotKey);
-
-    for (const runId of rootViewSnapshot.visibleRunIds) {
-      searchParams.append("visibleRunId", runId);
-    }
-
-    return `/resources/orgs/${organizationSlug}/projects/${projectSlug}/env/${environmentSlug}/runs/new?${searchParams.toString()}`;
+    return createRunsRefreshPath({
+      environmentSlug,
+      organizationSlug,
+      projectSlug,
+      requestKind: "background",
+      search: location.search,
+      snapshot: rootViewSnapshot,
+    });
   }, [
     environmentSlug,
     isRootEquivalentView,
@@ -158,12 +124,13 @@ export function useRunsLiveRefresh<
       return undefined;
     }
 
-    const searchParams = new URLSearchParams(location.search);
-    searchParams.delete("cursor");
-    searchParams.delete("direction");
-    searchParams.set("requestKind", "manual");
-
-    return `/resources/orgs/${organizationSlug}/projects/${projectSlug}/env/${environmentSlug}/runs/new?${searchParams.toString()}`;
+    return createRunsRefreshPath({
+      environmentSlug,
+      organizationSlug,
+      projectSlug,
+      requestKind: "manual",
+      search: location.search,
+    });
   }, [environmentSlug, isRootEquivalentView, location.search, organizationSlug, projectSlug]);
 
   useAutoLoad({
@@ -174,6 +141,7 @@ export function useRunsLiveRefresh<
     onFocus: true,
   });
 
+  // Reflect the latest background polling result into the background error state.
   useEffect(() => {
     const data = backgroundRunsFetcher.data;
     if (!data) {
@@ -188,6 +156,7 @@ export function useRunsLiveRefresh<
     setBackgroundError(undefined);
   }, [backgroundRunsFetcher.data]);
 
+  // Apply the manual refresh payload as the new root list snapshot, or surface its error.
   useEffect(() => {
     const data = manualRefreshFetcher.data;
     if (!data) {
@@ -210,16 +179,15 @@ export function useRunsLiveRefresh<
     setIsRefreshingLatest(false);
   }, [manualRefreshFetcher.data]);
 
-  const backgroundRunsData: Extract<RefreshRunsData<TRun>, { ok: true }> | undefined =
-    backgroundRunsFetcher.data && backgroundRunsFetcher.data.ok
-      ? backgroundRunsFetcher.data
-      : undefined;
-  // Ignore background results that were produced for an older root-view snapshot.
-  const currentBackgroundRunsData =
-    backgroundRunsData?.snapshotKey === currentSnapshotKey ? backgroundRunsData : undefined;
+  const currentBackgroundRunsData = getCurrentBackgroundRunsData(
+    backgroundRunsFetcher.data,
+    currentSnapshotKey
+  );
   const rootList = rootOverride
     ? { ...list, runs: rootOverride.runs, pagination: rootOverride.pagination ?? list.pagination }
     : list;
+  // Manual refresh replaces the root list immediately. Background refresh only swaps in rows
+  // that still match the current snapshot, so stale poll responses cannot overwrite newer state.
   const visibleRuns: TRun[] =
     isRootEquivalentView && !isRefreshingLatest && currentBackgroundRunsData?.runs
       ? currentBackgroundRunsData.runs
@@ -252,45 +220,61 @@ export function useRunsLiveRefresh<
   };
 }
 
-function createRootViewSnapshot<TRun extends { friendlyId: string; createdAt: Date | string }>(
-  runs: TRun[]
-) {
-  if (runs.length === 0) {
-    return undefined;
-  }
+function useRootViewState<
+  TRun extends { friendlyId: string; createdAt: Date | string },
+  TList extends RunsListShape<TRun>
+>({
+  isRootEquivalentView,
+  refreshPath,
+  runs,
+}: {
+  isRootEquivalentView: boolean;
+  refreshPath: string;
+  runs: TRun[];
+}) {
+  const [rootOverride, setRootOverride] = useState<RootOverride<TRun, TList>>();
+  const [rootViewSnapshot, setRootViewSnapshot] = useState<RootViewSnapshot | undefined>(() =>
+    isRootEquivalentView ? createRootViewSnapshot(runs) : undefined
+  );
+  const previousRefreshPathRef = useRef<string>();
 
-  return {
-    visibleRunIds: runs.map((run) => run.friendlyId),
-    latestCreatedAt: getLatestCreatedAt(runs),
-    snapshotKey: runs.map((run) => run.friendlyId).join(","),
-  };
-}
-
-function serializeRunCreatedAt(createdAt: Date | string) {
-  const date = createdAt instanceof Date ? createdAt : new Date(createdAt);
-  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
-}
-
-function getLatestCreatedAt<TRun extends { createdAt: Date | string }>(runs: TRun[]) {
-  let latestCreatedAt: string | undefined;
-  let latestCreatedAtMs = Number.NEGATIVE_INFINITY;
-
-  for (const run of runs) {
-    const serializedCreatedAt = serializeRunCreatedAt(run.createdAt);
-    if (!serializedCreatedAt) continue;
-
-    const createdAtMs = Date.parse(serializedCreatedAt);
-    if (!Number.isFinite(createdAtMs) || createdAtMs <= latestCreatedAtMs) {
-      continue;
+  // Maintain a root-view snapshot from the current list unless a manual refresh override is active.
+  useEffect(() => {
+    if (!isRootEquivalentView) {
+      setRootViewSnapshot(undefined);
+      setRootOverride(undefined);
+      return;
     }
 
-    latestCreatedAt = serializedCreatedAt;
-    latestCreatedAtMs = createdAtMs;
-  }
+    if (rootOverride) {
+      return;
+    }
 
-  return latestCreatedAt;
+    setRootViewSnapshot(createRootViewSnapshot(runs));
+  }, [isRootEquivalentView, rootOverride, runs]);
+
+  // Reset snapshot state when the root-view route or filters change.
+  useEffect(() => {
+    if (previousRefreshPathRef.current === refreshPath) {
+      return;
+    }
+
+    // Any filter or route change invalidates the captured root snapshot and manual override.
+    previousRefreshPathRef.current = refreshPath;
+    setRootOverride(undefined);
+
+    if (isRootEquivalentView) {
+      setRootViewSnapshot(createRootViewSnapshot(runs));
+    }
+  }, [isRootEquivalentView, refreshPath, runs]);
+
+  return {
+    rootOverride,
+    rootViewSnapshot,
+    setRootOverride,
+    setRootViewSnapshot,
+  };
 }
-
 function useAutoLoad({
   path,
   load,
@@ -310,12 +294,14 @@ function useAutoLoad({
   const pathRef = useRef(path);
   const stateRef = useRef(state);
 
+  // Keep the timer and focus handlers reading the latest load callback, path, and fetcher state.
   useEffect(() => {
     loadRef.current = load;
     pathRef.current = path;
     stateRef.current = state;
   }, [load, path, state]);
 
+  // Poll on an interval, but only while the page is visible and the previous request is idle.
   useEffect(() => {
     if (!path || !interval || interval <= 0 || disabled) return;
 
@@ -335,6 +321,7 @@ function useAutoLoad({
     return () => window.clearInterval(intervalId);
   }, [path, interval, disabled]);
 
+  // Trigger the same guarded auto-load when the tab becomes visible or the window regains focus.
   useEffect(() => {
     if (!path || !onFocus || disabled) return;
 
