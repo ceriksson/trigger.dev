@@ -14,7 +14,7 @@ import { DevDisconnectedBanner, useDevPresence } from "~/components/DevPresence"
 import { StepContentContainer } from "~/components/StepContentContainer";
 import { MainCenteredContainer, PageBody } from "~/components/layout/AppLayout";
 import { Badge } from "~/components/primitives/Badge";
-import { LinkButton } from "~/components/primitives/Buttons";
+import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { Header1 } from "~/components/primitives/Headers";
 import { InfoPanel } from "~/components/primitives/InfoPanel";
 import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
@@ -30,18 +30,24 @@ import { Spinner } from "~/components/primitives/Spinner";
 import { StepNumber } from "~/components/primitives/StepNumber";
 import { TextLink } from "~/components/primitives/TextLink";
 import { RunsFilters, type TaskRunListSearchFilters } from "~/components/runs/v3/RunFilters";
+import { RunsRefreshControls } from "~/components/runs/v3/RunsRefreshControls";
 import { TaskRunsTable } from "~/components/runs/v3/TaskRunsTable";
 import { BULK_ACTION_RUN_LIMIT } from "~/consts";
 import { $replica } from "~/db.server";
 import { useEnvironment } from "~/hooks/useEnvironment";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
+import { useRunsLiveRefresh } from "~/hooks/useRunsLiveRefresh";
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { useShortcutKeys } from "~/hooks/useShortcutKeys";
 import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { getRunFiltersFromRequest } from "~/presenters/RunFilters.server";
-import { NextRunListPresenter } from "~/presenters/v3/NextRunListPresenter.server";
+import {
+  type NextRunList,
+  type NextRunListItem,
+  NextRunListPresenter,
+} from "~/presenters/v3/NextRunListPresenter.server";
 import { clickhouseClient } from "~/services/clickhouseInstance.server";
 import {
   setRootOnlyFilterPreference,
@@ -193,11 +199,33 @@ function RunsList({
   filters: TaskRunListSearchFilters;
 }) {
   const navigation = useNavigation();
-  const isLoading = navigation.state !== "idle";
+  const { has, replace } = useSearchParams();
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
-  const { has, replace } = useSearchParams();
+  const {
+    backgroundError,
+    hasNewRuns,
+    isBackgroundRefreshing,
+    isRefreshingLatest,
+    isRootEquivalentView,
+    manualRefreshError,
+    newRunsCount,
+    refreshLatest,
+    visibleList,
+    visibleRuns,
+  } = useRunsLiveRefresh<NextRunListItem, NextRunList>({
+    list: list as NextRunList,
+    organizationSlug: organization.slug,
+    projectSlug: project.slug,
+    environmentSlug: environment.slug,
+  });
+  const bulkActionFilters = {
+    ...filters,
+    cursor: undefined,
+    direction: undefined,
+  };
+  const isLoading = navigation.state !== "idle" && !isRefreshingLatest;
 
   // Shortcut keys for bulk actions
   useShortcutKeys({
@@ -220,6 +248,15 @@ function RunsList({
       });
     },
   });
+  useShortcutKeys({
+    shortcut: { key: "n" },
+    disabled: !isRootEquivalentView || !hasNewRuns || isRefreshingLatest,
+    action: (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      refreshLatest();
+    },
+  });
 
   const isShowingBulkActionInspector = has("bulkInspector") && list.hasAnyRuns;
   return (
@@ -232,7 +269,7 @@ function RunsList({
           )}
         >
           <>
-            {list.runs.length === 0 && !list.hasAnyRuns ? (
+            {!visibleRuns.length && !list.hasAnyRuns ? (
               list.possibleTasks.length === 0 ? (
                 <CreateFirstTaskInstructions />
               ) : (
@@ -246,56 +283,68 @@ function RunsList({
               )
             ) : (
               <div className={cn("grid h-full max-h-full grid-rows-[auto_1fr] overflow-hidden")}>
-                <div className="flex items-start justify-between gap-x-2 p-2">
-                  <RunsFilters
-                    possibleTasks={list.possibleTasks}
-                    bulkActions={list.bulkActions}
-                    hasFilters={list.hasFilters}
-                    rootOnlyDefault={rootOnlyDefault}
-                  />
-                  <div className="flex items-center justify-end gap-x-2">
-                    {!isShowingBulkActionInspector && (
-                      <LinkButton
-                        variant="secondary/small"
-                        to={v3CreateBulkActionPath(
-                          organization,
-                          project,
-                          environment,
-                          filters,
-                          selectedItems.size > 0 ? "selected" : undefined
-                        )}
-                        LeadingIcon={ListCheckedIcon}
-                        className={selectedItems.size > 0 ? "pr-1" : undefined}
-                        tooltip={
-                          <div className="-mr-1 flex items-center gap-3 text-xs text-text-dimmed">
-                            <div className="flex items-center gap-0.5">
-                              <span>Replay</span>
-                              <ShortcutKey shortcut={{ key: "r" }} variant={"small"} />
-                            </div>
-                            <div className="flex items-center gap-0.5">
-                              <span>Cancel</span>
-                              <ShortcutKey shortcut={{ key: "c" }} variant={"small"} />
-                            </div>
-                          </div>
-                        }
-                      >
-                        <span className="flex items-center gap-x-1 whitespace-nowrap text-text-bright">
-                          <span>Bulk action</span>
-                          {selectedItems.size > 0 && (
-                            <Badge variant="rounded">{selectedItems.size}</Badge>
+                <div>
+                  <div className="flex items-start justify-between gap-x-2 p-2">
+                    <RunsFilters
+                      possibleTasks={list.possibleTasks}
+                      bulkActions={list.bulkActions}
+                      hasFilters={list.hasFilters}
+                      rootOnlyDefault={rootOnlyDefault}
+                    />
+                    <div className="flex items-center justify-end gap-x-2">
+                      <RunsRefreshControls
+                        backgroundError={backgroundError}
+                        hasNewRuns={hasNewRuns}
+                        isBackgroundRefreshing={isBackgroundRefreshing}
+                        isRefreshingLatest={isRefreshingLatest}
+                        isRootEquivalentView={isRootEquivalentView}
+                        manualRefreshError={manualRefreshError}
+                        newRunsCount={newRunsCount}
+                        onRefresh={refreshLatest}
+                      />
+                      {!isShowingBulkActionInspector && (
+                        <LinkButton
+                          variant="secondary/small"
+                          to={v3CreateBulkActionPath(
+                            organization,
+                            project,
+                            environment,
+                            bulkActionFilters,
+                            selectedItems.size > 0 ? "selected" : undefined
                           )}
-                        </span>
-                      </LinkButton>
-                    )}
-                    <ListPagination list={list} />
+                          LeadingIcon={ListCheckedIcon}
+                          className={selectedItems.size > 0 ? "pr-1" : undefined}
+                          tooltip={
+                            <div className="-mr-1 flex items-center gap-3 text-xs text-text-dimmed">
+                              <div className="flex items-center gap-0.5">
+                                <span>Replay</span>
+                                <ShortcutKey shortcut={{ key: "r" }} variant={"small"} />
+                              </div>
+                              <div className="flex items-center gap-0.5">
+                                <span>Cancel</span>
+                                <ShortcutKey shortcut={{ key: "c" }} variant={"small"} />
+                              </div>
+                            </div>
+                          }
+                        >
+                          <span className="flex items-center gap-x-1 whitespace-nowrap text-text-bright">
+                            <span>Bulk action</span>
+                            {selectedItems.size > 0 && (
+                              <Badge variant="rounded">{selectedItems.size}</Badge>
+                            )}
+                          </span>
+                        </LinkButton>
+                      )}
+                      <ListPagination list={visibleList} />
+                    </div>
                   </div>
                 </div>
 
                 <TaskRunsTable
-                  total={list.runs.length}
-                  hasFilters={list.hasFilters}
-                  filters={list.filters}
-                  runs={list.runs}
+                  total={visibleRuns.length}
+                  hasFilters={visibleList.hasFilters}
+                  filters={visibleList.filters}
+                  runs={visibleRuns}
                   isLoading={isLoading}
                   allowSelection
                   rootOnlyDefault={rootOnlyDefault}
